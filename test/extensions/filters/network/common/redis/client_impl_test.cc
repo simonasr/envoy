@@ -627,6 +627,11 @@ TEST_F(RedisClientImplTest, InitializedWithLocalZoneAffinityReplicasAndPrimaryRe
                                ConnPoolSettings::LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY);
 }
 
+TEST_F(RedisClientImplTest, InitializedWithLocalZoneAffinityAnyReadPolicy) {
+  testInitializeReadPolicy(envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::
+                               ConnPoolSettings::LOCAL_ZONE_AFFINITY_ANY);
+}
+
 TEST_F(RedisClientImplTest, Cancel) {
   InSequence s;
 
@@ -2100,15 +2105,19 @@ TEST_F(RedisClientImplTest, Resp3UserRequestHeldThenReplayedOnReady) {
   EXPECT_EQ(1UL, host_->cluster_.traffic_stats_->upstream_rq_cancelled_.value());
 }
 
+using ConnPoolSettings =
+    envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::ConnPoolSettings;
+
+class RedisClientImplResp3ReadPolicyTest
+    : public RedisClientImplTest,
+      public testing::WithParamInterface<ConnPoolSettings::ReadPolicy> {};
+
 // Non-Primary read policy: HELLO succeeds → AwaitingReadonly → READONLY sent (NOT before HELLO
 // ack); READONLY succeeds → Ready. Pins the strict HELLO-then-READONLY phasing.
-TEST_F(RedisClientImplTest, Resp3HelloSuccessThenReadonlyForNonPrimary) {
+TEST_P(RedisClientImplResp3ReadPolicyTest, Resp3HelloSuccessThenReadonlyForNonPrimary) {
   InSequence s;
   enableResp3();
-  setup(std::make_shared<ConfigImpl>(
-      createConnPoolSettings(20, true, true, 100,
-                             envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::
-                                 ConnPoolSettings::REPLICA)));
+  setup(std::make_shared<ConfigImpl>(createConnPoolSettings(20, true, true, 100, GetParam())));
 
   EXPECT_CALL(*encoder_, encode(Eq(makeBareHello3Request()), _));
   EXPECT_CALL(*flush_timer_, enabled()).WillOnce(Return(false));
@@ -2141,6 +2150,10 @@ TEST_F(RedisClientImplTest, Resp3HelloSuccessThenReadonlyForNonPrimary) {
   client_->close();
   EXPECT_EQ(0UL, hello3_failure_counter_->value());
 }
+
+INSTANTIATE_TEST_SUITE_P(ReadPolicies, RedisClientImplResp3ReadPolicyTest,
+                         testing::Values(ConnPoolSettings::REPLICA,
+                                         ConnPoolSettings::LOCAL_ZONE_AFFINITY_ANY));
 
 // AWS IAM + RESP3 sync token: addCallbackIfCredentialsPending returns false → token fetched
 // immediately → encode HELLO 3 AUTH user token.

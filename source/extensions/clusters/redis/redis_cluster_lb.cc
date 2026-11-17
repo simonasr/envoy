@@ -190,6 +190,33 @@ RedisClusterLoadBalancerFactory::RedisClusterLoadBalancer::chooseHost(
       }
     case NetworkFilters::Common::Redis::Client::ReadPolicy::Any:
       return chooseRandomHost(shard->allHosts(), random_);
+    case NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityAny: {
+      const auto& healthy_hosts = shard->allHosts().healthyHosts();
+      const auto& client_zone = redis_context->clientZone();
+      if (!client_zone.empty()) {
+        uint64_t local_count = 0;
+        for (const auto& host : healthy_hosts) {
+          if (host->locality().zone() == client_zone) {
+            ++local_count;
+          }
+        }
+        if (local_count != 0) {
+          uint64_t local_index = random_.random() % local_count;
+          for (const auto& host : healthy_hosts) {
+            if (host->locality().zone() == client_zone) {
+              if (local_index == 0) {
+                return host;
+              }
+              --local_index;
+            }
+          }
+        }
+      }
+      // Unlike chooseRandomHost, there is no separate degraded tier in this policy.
+      // Every resolved shard contains at least its primary, so candidates is nonempty.
+      const auto& candidates = healthy_hosts.empty() ? shard->allHosts().hosts() : healthy_hosts;
+      return candidates[random_.random() % candidates.size()];
+    }
     case NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity: {
       // Spread read requests between replicas in the same zone in round robin.
       // Falls back to other replicas or primary if needed.

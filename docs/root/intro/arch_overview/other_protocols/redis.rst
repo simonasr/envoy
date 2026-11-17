@@ -84,6 +84,28 @@ following information:
 
 Envoy proxy supports identification of the nodes via both IP address and hostnames in the ``cluster slots`` command response. In case of failure to resolve a primary hostname, Envoy will retry resolution of all nodes periodically until success. Failure to resolve a replica simply skips that replica. On the other hand, if the :ref:`enable_redirection <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.enable_redirection>` option is set and a MOVED or ASK response containing a hostname is received Envoy will not automatically do a DNS lookup and instead bubble the error to the client verbatim. To have Envoy do the DNS lookup and follow the redirection, you need to configure the DNS cache option :ref:`dns_cache_config <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.dns_cache_config>` under the connection pool settings. For a configuration example on how to enable DNS lookups for redirections, see the filter :ref:`configuration reference <config_network_filters_redis_proxy>`.
 
+The :ref:`read_policy <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.read_policy>`
+option ``LOCAL_ZONE_AFFINITY_ANY`` selects randomly among healthy primary and replica nodes in the
+same zone as Envoy, without role preference. If no healthy local nodes exist, it selects from healthy
+members of the shard globally. If none are healthy, it selects from all shard members, without
+preferring degraded nodes over unhealthy nodes. This last tier is fail-open: it can select failed or
+draining nodes and is not a maintenance exclusion mechanism. Writes and active transactions still
+use the primary. Replica reads can return stale data because replication is asynchronous.
+
+Local preference requires a nonempty Envoy ``node.locality.zone`` and backend zones discovered using
+:ref:`enable_zone_discovery <envoy_v3_api_field_extensions.clusters.redis.v3.RedisClusterConfig.enable_zone_discovery>`
+with Valkey's ``availability_zone`` INFO field. Zone strings must match exactly. An empty Envoy zone
+disables local preference; backend nodes with missing zones are eligible only for global fallback.
+Leave the seed endpoint-group's locality zone empty: undiscovered backends inherit the first seed
+endpoint-group's locality, which can otherwise incorrectly classify remote nodes as local. Backend
+hosts also inherit the first seed endpoint's health status; an artificially degraded seed can leave
+all hosts outside the healthy tiers and disable local preference. INFO failures can temporarily
+remove discovered zones and cause global fallback. MOVED and ASK redirects follow explicit targets
+and are not constrained by local preference.
+
+Upgrade binaries before configuring this enum value: older binaries reject it. Restore a supported
+read policy before rolling back binaries.
+
 For topology configuration details, see the Redis Cluster
 :ref:`v3 API reference <envoy_v3_api_msg_extensions.clusters.redis.v3.RedisClusterConfig>`.
 

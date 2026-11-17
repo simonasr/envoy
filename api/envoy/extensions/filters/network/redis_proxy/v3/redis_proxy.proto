@@ -99,6 +99,18 @@ message RedisProxy {
       //
       // Note: Zone discovery currently works with Valkey only.
       LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY = 6;
+
+      // Read from healthy nodes in the same availability zone as the Envoy proxy, selecting
+      // randomly among the primary and replicas without role preference. If no healthy local
+      // nodes exist, select from all healthy nodes in the shard. If none are healthy, select
+      // from all nodes in the shard, without preferring degraded nodes over unhealthy nodes.
+      //
+      // An empty client zone disables local preference. Nodes with an empty zone are eligible
+      // only for global fallback. The client zone comes from Envoy's node locality.
+      //
+      // Note: Zone discovery currently works with Valkey only and requires
+      // :ref:`enable_zone_discovery <envoy_v3_api_field_extensions.clusters.redis.v3.RedisClusterConfig.enable_zone_discovery>`.
+      LOCAL_ZONE_AFFINITY_ANY = 7;
     }
 
     // Per-operation timeout in milliseconds. The timer starts when the first

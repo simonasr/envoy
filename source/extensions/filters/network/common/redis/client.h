@@ -127,7 +127,9 @@ enum class ReadPolicy {
   // Zone-aware routing: prefer replicas in same zone, fallback to any replica, then primary
   LocalZoneAffinity,
   // Zone-aware routing: prefer replicas in same zone, then primary in same zone, then any
-  LocalZoneAffinityReplicasAndPrimary
+  LocalZoneAffinityReplicasAndPrimary,
+  // Prefer healthy local primary and replicas, then healthy global members, then all members.
+  LocalZoneAffinityAny
 };
 
 /**

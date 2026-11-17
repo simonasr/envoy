@@ -83,6 +83,10 @@ ConfigImpl::ConfigImpl(
       LOCAL_ZONE_AFFINITY_REPLICAS_AND_PRIMARY:
     read_policy_ = ReadPolicy::LocalZoneAffinityReplicasAndPrimary;
     break;
+  case envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::ConnPoolSettings::
+      LOCAL_ZONE_AFFINITY_ANY:
+    read_policy_ = ReadPolicy::LocalZoneAffinityAny;
+    break;
   }
 
   if (config.has_connection_rate_limit()) {

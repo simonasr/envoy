@@ -102,7 +102,7 @@ public:
         Common::Redis::Client::createConnPoolSettings(20, hashtagging, true, max_unknown_conns,
                                                       read_policy_, redis_cx_rate_limit_per_sec),
         api_, store_.rootScope(), redis_command_stats, cluster_refresh_manager_, dns_cache,
-        std::nullopt, std::nullopt, /*local_zone=*/"", protocol_version);
+        std::nullopt, std::nullopt, local_zone_, protocol_version);
     conn_pool_impl->init();
     // Set the authentication password for this connection pool.
     conn_pool_impl->tls_->getTyped<InstanceImpl::ThreadLocalPool>().auth_username_ = auth_username_;
@@ -342,6 +342,7 @@ public:
   Network::Address::InstanceConstSharedPtr test_address_;
   std::string auth_username_;
   std::string auth_password_;
+  std::string local_zone_;
   NiceMock<Api::MockApi> api_;
   envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::ConnPoolSettings::ReadPolicy
       read_policy_ = envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::
@@ -676,7 +677,46 @@ TEST_F(RedisConnPoolImplTest, BasicWithReadPolicy) {
   testReadPolicy(
       envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::ConnPoolSettings::ANY,
       NetworkFilters::Common::Redis::Client::ReadPolicy::Any);
+  testReadPolicy(envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::
+                     ConnPoolSettings::LOCAL_ZONE_AFFINITY_ANY,
+                 NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityAny);
 };
+
+TEST_F(RedisConnPoolImplTest, LocalZoneAffinityAnyRequestContexts) {
+  read_policy_ = envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::
+      ConnPoolSettings::LOCAL_ZONE_AFFINITY_ANY;
+  local_zone_ = "zone-a";
+  setup();
+
+  auto value = std::make_shared<Common::Redis::RespValue>();
+  value->type(Common::Redis::RespType::Array);
+  value->asArray().resize(2);
+  value->asArray()[0].type(Common::Redis::RespType::BulkString);
+  value->asArray()[0].asString() = "get";
+  value->asArray()[1].type(Common::Redis::RespType::BulkString);
+  value->asArray()[1].asString() = "foo";
+  StrictMock<MockPoolCallbacks> callbacks;
+
+  for (const bool active_transaction : {false, true}) {
+    transaction_.active_ = active_transaction;
+    EXPECT_CALL(cm_.thread_local_cluster_.lb_, chooseHost(_))
+        .Times(2)
+        .WillRepeatedly([&, active_transaction](Upstream::LoadBalancerContext* context)
+                            -> Upstream::HostConstSharedPtr {
+          auto* redis_context = dynamic_cast<Clusters::Redis::RedisLoadBalancerContext*>(context);
+          EXPECT_NE(nullptr, redis_context);
+          EXPECT_TRUE(redis_context->isReadCommand());
+          EXPECT_EQ("zone-a", redis_context->clientZone());
+          EXPECT_EQ(active_transaction ? Common::Redis::Client::ReadPolicy::Primary
+                                       : Common::Redis::Client::ReadPolicy::LocalZoneAffinityAny,
+                    redis_context->readPolicy());
+          return nullptr;
+        });
+    EXPECT_EQ(nullptr, conn_pool_->makeRequest("foo", value, callbacks, transaction_));
+    EXPECT_EQ(nullptr, conn_pool_->makeRequestToShard(0, value, callbacks, transaction_));
+  }
+  tls_.shutdownThread();
+}
 
 TEST_F(RedisConnPoolImplTest, Hashtagging) {
   InSequence s;

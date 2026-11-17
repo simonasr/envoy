@@ -1,4 +1,7 @@
 #include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "source/extensions/clusters/redis/redis_cluster_lb.h"
 #include "source/extensions/filters/network/common/redis/client.h"
@@ -1002,6 +1005,174 @@ TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityEmptyClientZone) {
   };
   validateAssignment(hosts, expected_assignments, true,
                      NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinity, "");
+}
+
+struct LocalZoneAffinityAnyTestCase {
+  std::string name;
+  std::vector<std::string> zones;
+  std::vector<std::optional<Upstream::Host::HealthFlag>> health_flags;
+  std::string client_zone;
+  std::vector<uint32_t> expected_hosts;
+};
+
+class LocalZoneAffinityAnyTest : public RedisClusterLoadBalancerTest,
+                                 public testing::WithParamInterface<LocalZoneAffinityAnyTestCase> {
+};
+
+TEST_P(LocalZoneAffinityAnyTest, Selection) {
+  const auto& test_case = GetParam();
+  Upstream::HostVector hosts;
+  for (uint32_t i = 0; i < test_case.zones.size(); ++i) {
+    auto host = makeHostWithZone("tcp://127.0.0.1:" + std::to_string(90 + i), test_case.zones[i]);
+    if (i < test_case.health_flags.size() && test_case.health_flags[i].has_value()) {
+      host->healthFlagSet(test_case.health_flags[i].value());
+    }
+    hosts.push_back(host);
+  }
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(
+      std::vector<ClusterSlot>{ClusterSlot(0, 8191, hosts[0]->address())});
+  for (uint32_t i = 1; i < hosts.size(); ++i) {
+    slots->at(0).addReplica(hosts[i]->address());
+  }
+  auto other_primary = makeHostWithZone("tcp://127.0.0.2:90", "zone-a");
+  slots->emplace_back(8192, 16383, other_primary->address());
+  auto all_hosts = generateHostMap(hosts);
+  all_hosts.emplace(other_primary->address()->asString(), other_primary);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+  auto lb = lb_->factory()->create(lb_params_);
+
+  NetworkFilters::Common::Redis::RespValue request;
+  request.type(NetworkFilters::Common::Redis::RespType::Array);
+  request.asArray().resize(2);
+  request.asArray()[0].type(NetworkFilters::Common::Redis::RespType::BulkString);
+  request.asArray()[0].asString() = "get";
+  request.asArray()[1].type(NetworkFilters::Common::Redis::RespType::BulkString);
+  request.asArray()[1].asString() = "foo";
+  const auto policy = NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityAny;
+  TestLoadBalancerContext key_context(100, true, policy, test_case.client_zone);
+  RedisSpecifyShardContextImpl shard_context(0, request, policy, test_case.client_zone);
+
+  // Shard construction also uses the RNG; only constrain draws after installing the topology.
+  // Replicas are sorted by address, so these indexes follow the host vector.
+  for (uint64_t i = 0; i < test_case.expected_hosts.size() * 2; ++i) {
+    EXPECT_CALL(random_, random()).Times(2).WillRepeatedly(Return(i));
+    const auto& expected = hosts[test_case.expected_hosts[i % test_case.expected_hosts.size()]];
+    EXPECT_EQ(expected, lb->chooseHost(&key_context).host);
+    EXPECT_EQ(expected, lb->chooseHost(&shard_context).host);
+  }
+
+  TestLoadBalancerContext other_key(8192, true, policy, test_case.client_zone);
+  RedisSpecifyShardContextImpl other_shard(1, request, policy, test_case.client_zone);
+  EXPECT_CALL(random_, random()).Times(2).WillRepeatedly(Return(17));
+  EXPECT_EQ(other_primary, lb->chooseHost(&other_key).host);
+  EXPECT_EQ(other_primary, lb->chooseHost(&other_shard).host);
+
+  EXPECT_CALL(random_, random()).Times(0);
+  TestLoadBalancerContext write_context(100, false, policy, test_case.client_zone);
+  EXPECT_EQ(hosts[0], lb->chooseHost(&write_context).host);
+  RedisSpecifyShardContextImpl invalid_shard(2, request, policy, test_case.client_zone);
+  EXPECT_EQ(nullptr, lb->chooseHost(&invalid_shard).host);
+}
+
+using HealthFlag = Upstream::Host::HealthFlag;
+INSTANTIATE_TEST_SUITE_P(
+    ReadPolicies, LocalZoneAffinityAnyTest,
+    testing::Values(
+        LocalZoneAffinityAnyTestCase{"LocalPrimaryAndReplicas",
+                                     {"zone-a", "zone-a", "zone-a", "zone-b", ""},
+                                     {},
+                                     "zone-a",
+                                     {0, 1, 2}},
+        LocalZoneAffinityAnyTestCase{"LocalPrimaryOnly", {"zone-a", "zone-b"}, {}, "zone-a", {0}},
+        LocalZoneAffinityAnyTestCase{
+            "LocalReplicasOnly", {"zone-b", "zone-a", "zone-a"}, {}, "zone-a", {1, 2}},
+        LocalZoneAffinityAnyTestCase{"NoReplicas", {"zone-b"}, {}, "zone-a", {0}},
+        LocalZoneAffinityAnyTestCase{"FailedLocalMembers",
+                                     {"zone-a", "zone-a", "zone-b", ""},
+                                     {HealthFlag::FAILED_ACTIVE_HC, HealthFlag::FAILED_ACTIVE_HC},
+                                     "zone-a",
+                                     {2, 3}},
+        LocalZoneAffinityAnyTestCase{"OutlierFailedLocal",
+                                     {"zone-a", "zone-b"},
+                                     {HealthFlag::FAILED_OUTLIER_CHECK},
+                                     "zone-a",
+                                     {1}},
+        LocalZoneAffinityAnyTestCase{
+            "DegradedLocal", {"zone-a", "zone-b"}, {HealthFlag::DEGRADED_ACTIVE_HC}, "zone-a", {1}},
+        LocalZoneAffinityAnyTestCase{
+            "EmptyClientZone", {"zone-a", "zone-b", ""}, {}, "", {0, 1, 2}},
+        LocalZoneAffinityAnyTestCase{
+            "UnmatchedClientZone", {"zone-a", "zone-b", ""}, {}, "zone-c", {0, 1, 2}},
+        LocalZoneAffinityAnyTestCase{"MissingBackendZones", {"", "", ""}, {}, "zone-a", {0, 1, 2}},
+        LocalZoneAffinityAnyTestCase{
+            "ExactZoneMatch", {"zone-a", "ZONE-A", "zone-a "}, {}, "zone-a", {0}},
+        LocalZoneAffinityAnyTestCase{"MixedDegradedAndFailed",
+                                     {"zone-a", "zone-b"},
+                                     {HealthFlag::DEGRADED_ACTIVE_HC, HealthFlag::FAILED_ACTIVE_HC},
+                                     "zone-a",
+                                     {0, 1}},
+        LocalZoneAffinityAnyTestCase{"AllFailed",
+                                     {"zone-a", "zone-b"},
+                                     {HealthFlag::FAILED_ACTIVE_HC, HealthFlag::FAILED_ACTIVE_HC},
+                                     "zone-a",
+                                     {0, 1}},
+        LocalZoneAffinityAnyTestCase{
+            "AllDegraded",
+            {"zone-a", "zone-b"},
+            {HealthFlag::DEGRADED_EDS_HEALTH, HealthFlag::DEGRADED_EDS_HEALTH},
+            "zone-a",
+            {0, 1}},
+        LocalZoneAffinityAnyTestCase{
+            "AllDraining",
+            {"zone-a", "zone-b"},
+            {HealthFlag::EDS_STATUS_DRAINING, HealthFlag::EDS_STATUS_DRAINING},
+            "zone-a",
+            {0, 1}}),
+    [](const testing::TestParamInfo<LocalZoneAffinityAnyTestCase>& info) {
+      return info.param.name;
+    });
+
+TEST_F(RedisClusterLoadBalancerTest, LocalZoneAffinityAnyHealthUpdates) {
+  Upstream::HostVector hosts{makeHostWithZone("tcp://127.0.0.1:90", "zone-a"),
+                             makeHostWithZone("tcp://127.0.0.1:91", "zone-a"),
+                             makeHostWithZone("tcp://127.0.0.1:92", "zone-b")};
+  ClusterSlotsPtr slots = std::make_unique<std::vector<ClusterSlot>>(
+      std::vector<ClusterSlot>{ClusterSlot(0, 16383, hosts[0]->address())});
+  slots->at(0).addReplica(hosts[1]->address());
+  slots->at(0).addReplica(hosts[2]->address());
+  auto all_hosts = generateHostMap(hosts);
+  init();
+  factory_->onClusterSlotUpdate(std::move(slots), all_hosts);
+  auto lb = lb_->factory()->create(lb_params_);
+  TestLoadBalancerContext context(
+      100, true, NetworkFilters::Common::Redis::Client::ReadPolicy::LocalZoneAffinityAny, "zone-a");
+
+  EXPECT_CALL(random_, random()).WillOnce(Return(1));
+  EXPECT_EQ(hosts[1], lb->chooseHost(&context).host);
+  testing::Mock::VerifyAndClearExpectations(&random_);
+
+  hosts[0]->healthFlagSet(HealthFlag::FAILED_ACTIVE_HC);
+  hosts[1]->healthFlagSet(HealthFlag::FAILED_ACTIVE_HC);
+  factory_->onHostHealthUpdate();
+  worker_priority_set_.runUpdateCallbacks(0, {}, {});
+  EXPECT_CALL(random_, random()).WillOnce(Return(0));
+  EXPECT_EQ(hosts[2], lb->chooseHost(&context).host);
+  testing::Mock::VerifyAndClearExpectations(&random_);
+
+  hosts[0]->healthFlagClear(HealthFlag::FAILED_ACTIVE_HC);
+  factory_->onHostHealthUpdate();
+  worker_priority_set_.runUpdateCallbacks(0, {}, {});
+  EXPECT_CALL(random_, random()).WillOnce(Return(1));
+  EXPECT_EQ(hosts[0], lb->chooseHost(&context).host);
+  testing::Mock::VerifyAndClearExpectations(&random_);
+
+  hosts[0]->healthFlagSet(HealthFlag::FAILED_ACTIVE_HC);
+  hosts[2]->healthFlagSet(HealthFlag::FAILED_ACTIVE_HC);
+  factory_->onHostHealthUpdate();
+  worker_priority_set_.runUpdateCallbacks(0, {}, {});
+  EXPECT_CALL(random_, random()).WillOnce(Return(1));
+  EXPECT_EQ(hosts[1], lb->chooseHost(&context).host);
 }
 
 } // namespace Redis
